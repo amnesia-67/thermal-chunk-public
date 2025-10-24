@@ -1,0 +1,296 @@
+/*
+
+Authors     : Anish Subash, Caden Wate
+Date        : 20 October, 2025 (end date)
+Description : Finds a setpoint power modelled around a custom equation build by our team (NOT DEPLOYEMENT CODE).   
+Usage       : Flashed on ESP32
+
+==========================
+
+ACCURACY    : within 0.16 of setpoint for 0-80C (Potentially higher)
+LIMITATION  : Stabilization time too slow ( > 2.5 mins)
+PROS        : Excellent at stabilization
+
+*/
+
+#include <Arduino.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <math.h>
+
+// ======== PIN CONFIG ========
+#define BUS_A_PIN 4
+#define BUS_B_PIN 5
+#define PIN_RPWM   9   // HEAT
+#define PIN_LPWM  10   // COOL
+
+// ======== PWM (ESP32 Arduino-core v3) ========
+const uint32_t PWM_FREQ = 3000;
+const uint8_t  PWM_RES  = 10;
+inline uint32_t dutyFromPct(int pct){
+  pct = constrain(pct, 0, 100);
+  return (uint32_t)((((1UL << PWM_RES) - 1) * (uint32_t)pct) / 100UL);
+}
+
+// ======== LIMITS / BEHAVIOR ========
+#define TEC_FLIPPED 0
+// Deadband shown in UI only; control uses explicit ±1.0 / ±0.2 logic
+float DEAD_BAND_C = 0.20f;
+
+const float FAST_BAND_C = 1.0f;   // >1.0C away -> full power
+const float TIGHT_BAND_C = 0.2f;  // <=0.2C -> exact model power
+const int   NUDGE = 2;            // ±2% nudges in the 0.2..1.0C region
+
+int   MIN_DUTY = 0;               // 0..95 as requested
+int   MAX_DUTY = 95;
+
+// tiny polarity hysteresis (only used outside ±1C band)
+const float POL_HYST_C = 0.30f;
+
+// Loop & sensors
+const unsigned LOOP_MS = 100;     // 10 Hz
+uint8_t  DS_RES  = 11;            // 11-bit, ~375 ms
+unsigned CONV_MS = 375;
+
+// ======== Exponential constant-power model (your algorithm) ========
+// p = (SP - room) * exp(K_NUM / tau);   +p = heat, -p = cool
+const float K_NUM  = 1.6f;
+const float T_COOL = 1.13f;  // use when SP < room
+const float T_HEAT = 10.2f;  // use when SP > room
+
+// ======== STATE ========
+float setpointC = 24.0f;
+bool  ctrlEnabled = true;    // ON/OFF (kept as "PID" cmds for compatibility)
+
+// default control sensor (you can 'sel B0' from Python)
+char  ctrlBus = 'B';
+int   ctrlIdx = 0;
+
+int   lastDutyPct = 0;
+char  lastMode    = 'S';
+
+OneWire owA(BUS_A_PIN), owB(BUS_B_PIN);
+DallasTemperature dA(&owA), dB(&owB);
+typedef uint8_t DeviceAddress[8];
+const int MAX_DEV = 16;
+DeviceAddress addrA[MAX_DEV], addrB[MAX_DEV];
+int cntA=0, cntB=0;
+float tempsA[MAX_DEV], tempsB[MAX_DEV];
+
+unsigned long lastMs=0, lastConvMs=0;
+
+// ----------------- helpers -----------------
+void printAddr(const DeviceAddress a){
+  for (int i=0;i<8;i++){ if(a[i]<16) Serial.print('0'); Serial.print(a[i],HEX); if(i<7) Serial.print(':'); }
+}
+int discover(DallasTemperature& d, DeviceAddress arr[], int maxDev){
+  d.begin(); d.setResolution(DS_RES); d.setWaitForConversion(false);
+  d.requestTemperatures(); delay(10);
+  int found = d.getDeviceCount(); if (found>maxDev) found=maxDev;
+  int ok=0; for (int i=0;i<found;i++) if (d.getAddress(arr[ok], i)) ok++;
+  return ok;
+}
+float readByAddress(DallasTemperature& d, const DeviceAddress a){ return d.getTempC((uint8_t*)a); }
+void requestAll(){ dA.requestTemperatures(); dB.requestTemperatures(); }
+void readAll(){ for(int i=0;i<cntA;i++) tempsA[i]=readByAddress(dA,addrA[i]);
+                for(int i=0;i<cntB;i++) tempsB[i]=readByAddress(dB,addrB[i]); }
+float pickPV(){
+  if (ctrlBus=='A' && ctrlIdx<cntA) return tempsA[ctrlIdx];
+  if (ctrlBus=='B' && ctrlIdx<cntB) return tempsB[ctrlIdx];
+  return NAN;
+}
+inline bool tempsReady(){ return (millis()-lastConvMs)>=CONV_MS; }
+
+inline int slewLimitDuty(int targetPct){
+  const int dUmax = 10; // %/tick
+  int delta = targetPct - lastDutyPct;
+  if (delta >  dUmax) targetPct = lastDutyPct + dUmax;
+  if (delta < -dUmax) targetPct = lastDutyPct - dUmax;
+  return constrain(targetPct, 0, 100);
+}
+
+// Signed constant-power model (+ = heat, - = cool)
+inline float modelPower(float sp, float room){
+  float tau = (sp < room) ? T_COOL : T_HEAT;
+  float p   = (sp - room) * expf(K_NUM / tau);
+  return p; // signed
+}
+
+// -------- H-bridge control --------
+void heatPercent(int pct){
+  pct = constrain(pct, 0, 100);
+  uint32_t d = dutyFromPct(pct);
+#if TEC_FLIPPED
+  ledcWrite(PIN_RPWM, 0);  ledcWrite(PIN_LPWM, d);
+#else
+  ledcWrite(PIN_LPWM, 0);  ledcWrite(PIN_RPWM, d);
+#endif
+  lastDutyPct = pct; lastMode = (pct>0)?'H':'S';
+}
+void coolPercent(int pct){
+  pct = constrain(pct, 0, 100);
+  uint32_t d = dutyFromPct(pct);
+#if TEC_FLIPPED
+  ledcWrite(PIN_LPWM, 0);  ledcWrite(PIN_RPWM, d);
+#else
+  ledcWrite(PIN_RPWM, 0);  ledcWrite(PIN_LPWM, d);
+#endif
+  lastDutyPct = pct; lastMode = (pct>0)?'C':'S';
+}
+void allOff(){ ledcWrite(PIN_RPWM,0); ledcWrite(PIN_LPWM,0); lastDutyPct=0; lastMode='S'; }
+
+// ======== UI ========
+void printMenu(){
+  Serial.println(F("\nCommands:"));
+  Serial.println(F("  tNN       -> setpoint NN°C"));
+  Serial.println(F("  p1/p0     -> control on/off"));
+  Serial.println(F("  sel A0|B0 -> pick control sensor"));
+  Serial.println(F("  list      -> list sensor addresses"));
+  Serial.println(F("  hNN / cNN -> manual heat/cool NN% (control OFF)"));
+  Serial.println(F("  s         -> stop outputs"));
+  Serial.println(F("  db X / min X / max X  -> deadband display, duty caps"));
+  Serial.println(F("  res 10|11 -> DS18B20 bits"));
+}
+void handleSerial(){
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n'); line.trim(); if(!line.length()) return;
+
+  if (line=="m"){ printMenu(); return; }
+  if (line=="s"){ ctrlEnabled=false; allOff(); Serial.println("STOP"); return; }
+  if (line=="p1"){ ctrlEnabled=true;  Serial.println("CTRL: ON"); return; }
+  if (line=="p0"){ ctrlEnabled=false; Serial.println("CTRL: OFF"); return; }
+
+  if (line=="list"){
+    Serial.print("Bus A (GPIO "); Serial.print(BUS_A_PIN); Serial.print(") = "); Serial.print(cntA); Serial.println(" device(s)");
+    for (int i=0;i<cntA;i++){ Serial.print("  A[");Serial.print(i);Serial.print("] "); printAddr(addrA[i]); Serial.println(); }
+    Serial.print("Bus B (GPIO "); Serial.print(BUS_B_PIN); Serial.print(") = "); Serial.print(cntB); Serial.println(" device(s)");
+    for (int i=0;i<cntB;i++){ Serial.print("  B[");Serial.print(i);Serial.print("] "); printAddr(addrB[i]); Serial.println(); }
+    return;
+  }
+
+  if (line[0]=='t'){ float sp=line.substring(1).toFloat();
+    if (sp>-40&&sp<120){ setpointC=sp; Serial.printf("Setpoint = %.1f °C\n", setpointC);} return; }
+
+  if (line.startsWith("sel")){
+    if (line.length()>=5){
+      char b = toupper(line.charAt(4)); int idx = line.substring(5).toInt();
+      if ((b=='A' && idx<cntA) || (b=='B' && idx<cntB)){ ctrlBus=b; ctrlIdx=idx;
+        Serial.print("Control PV = "); Serial.print(ctrlBus); Serial.println(ctrlIdx); }
+      else Serial.println("Invalid selection.");
+    } else Serial.println("Use: sel A0  or  sel B0");
+    return;
+  }
+
+  // manual overrides
+  if (line[0]=='h'){ int pct=line.substring(1).toInt(); ctrlEnabled=false; heatPercent(constrain(pct,0,100)); Serial.printf("HEAT %d%% (OFF)\n", constrain(pct,0,100)); return; }
+  if (line[0]=='c'){ int pct=line.substring(1).toInt(); ctrlEnabled=false; coolPercent(constrain(pct,0,100)); Serial.printf("COOL %d%% (OFF)\n", constrain(pct,0,100)); return; }
+
+  if (line.startsWith("db ")){ DEAD_BAND_C = max(0.0f, line.substring(3).toFloat()); Serial.printf("deadband=%.3f C\n", DEAD_BAND_C); return; }
+  if (line.startsWith("min ")){ MIN_DUTY = constrain(line.substring(4).toInt(), 0, 95); Serial.printf("MIN_DUTY=%d%%\n", MIN_DUTY); return; }
+  if (line.startsWith("max ")){ MAX_DUTY = constrain(line.substring(4).toInt(), 0, 95); Serial.printf("MAX_DUTY=%d%%\n", MAX_DUTY); return; }
+
+  if (line.startsWith("res ")){
+    int r = line.substring(4).toInt();
+    if (r==10 || r==11){ DS_RES=r; CONV_MS = (r==10)?188:375; dA.setResolution(DS_RES); dB.setResolution(DS_RES);
+      Serial.printf("DS18B20 res=%d-bit, CONV_MS=%u\n", DS_RES, CONV_MS); }
+    else Serial.println("Use: res 10  or  res 11");
+    return;
+  }
+
+  Serial.println("Unknown cmd. Type 'm' for menu.");
+}
+
+// ======== SETUP ========
+void setup(){
+  Serial.begin(115200); delay(300);
+  Serial.println("\nBOOT: Constant-Power Model with 1.0/0.2/±2% staging");
+
+  bool ok1 = ledcAttach(PIN_RPWM, PWM_FREQ, PWM_RES);
+  bool ok2 = ledcAttach(PIN_LPWM, PWM_FREQ, PWM_RES);
+  if (!ok1 || !ok2) Serial.println("LEDC attach failed.");
+  allOff();
+
+  dA.begin(); dB.begin();
+  dA.setResolution(DS_RES); dB.setResolution(DS_RES);
+  dA.setWaitForConversion(false); dB.setWaitForConversion(false);
+
+  cntA = discover(dA, addrA, MAX_DEV);
+  cntB = discover(dB, addrB, MAX_DEV);
+
+  Serial.println("CSV header: time_s,PV,SP,A[0..],B[0..],mode,duty%");
+  requestAll(); lastConvMs = millis(); lastMs = millis();
+}
+
+// ======== MAIN LOOP ========
+void loop(){
+  handleSerial();
+  if (millis() - lastMs < LOOP_MS) return;
+  lastMs = millis();
+
+  static bool first=true;
+  if (first || tempsReady()){
+    if (!first) readAll();
+    requestAll(); lastConvMs=millis(); first=false;
+
+    float pv = pickPV();
+    if (!(ctrlEnabled && !isnan(pv))){
+      allOff();
+      // CSV
+      Serial.print(millis()/1000.0f,1); Serial.print(",");
+      if (!isnan(pv)) Serial.print(pv,2); else Serial.print("NaN"); Serial.print(",");
+      Serial.print(setpointC,2); Serial.print(",");
+      for (int i=0;i<cntA;i++){ if(i) Serial.print("|"); Serial.print(tempsA[i],2); }
+      Serial.print(",");
+      for (int i=0;i<cntB;i++){ if(i) Serial.print("|"); Serial.print(tempsB[i],2); }
+      Serial.print(","); Serial.print(lastMode); Serial.print(","); Serial.println(lastDutyPct);
+      return;
+    }
+
+    // -------- control logic --------
+    float room = (!isnan(tempsA[2])) ? tempsA[2] : pv; // A2 is room if present
+    float err  = setpointC - pv;
+    float abserr = fabsf(err);
+
+    // 1) Far from SP (>1.0C): full power toward SP
+    if (abserr > FAST_BAND_C){
+      int duty = slewLimitDuty(MAX_DUTY);
+      if (err > 0) heatPercent(duty); else coolPercent(duty);
+    } else {
+      // 2) Near SP (≤1.0C): constant-power model with ±2% staging
+      float p_model = modelPower(setpointC, room);        // signed (+ heat, - cool)
+      int   baseMag = (int)roundf(fabsf(p_model));
+      baseMag = constrain(baseMag, MIN_DUTY, MAX_DUTY);
+
+      // Keep polarity equal to the model’s sign inside ±1C (do NOT flip)
+      int signMode = (p_model >= 0.0f) ? +1 : -1;
+
+      int mag = baseMag;
+      if (abserr > TIGHT_BAND_C){
+        // outside ±0.2C but within ±1C → apply ±2% nudge to correct direction WITHOUT changing sign
+        if (err > 0){
+          // too cold -> want warmer
+          mag += (signMode > 0) ? +NUDGE : -NUDGE;  // more heat OR less cool
+        } else {
+          // too hot -> want colder
+          mag += (signMode > 0) ? -NUDGE : +NUDGE;  // less heat OR more cool
+        }
+      }
+      mag = constrain(mag, MIN_DUTY, MAX_DUTY);
+      mag = slewLimitDuty(mag);
+
+      if (signMode > 0) heatPercent(mag);
+      else              coolPercent(mag);
+    }
+
+    // CSV
+    Serial.print(millis()/1000.0f,1); Serial.print(",");
+    if (!isnan(pv)) Serial.print(pv,2); else Serial.print("NaN"); Serial.print(",");
+    Serial.print(setpointC,2); Serial.print(",");
+    for (int i=0;i<cntA;i++){ if(i) Serial.print("|"); Serial.print(tempsA[i],2); }
+    Serial.print(",");
+    for (int i=0;i<cntB;i++){ if(i) Serial.print("|"); Serial.print(tempsB[i],2); }
+    Serial.print(",");
+    Serial.print(lastMode); Serial.print(",");
+    Serial.println(lastDutyPct);
+  }
+}
